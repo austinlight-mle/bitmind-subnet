@@ -68,11 +68,49 @@ class OpenAIService(BaseGenerationService):
         else:
             raise ValueError(f"Unsupported modality: {task.modality}")
 
+    def _build_image_prompt(self, task: GenerationTask) -> str:
+        """Build the final prompt sent to the image model.
+
+        This is intended to improve visual richness and clarity while
+        staying faithful to the original task.prompt.
+        """
+        base = (task.prompt or "").strip()
+        params: Dict[str, Any] = task.parameters or {}
+
+        style_parts = []
+
+        style = params.get("style")
+        if style:
+            style_parts.append(style)
+
+        camera = params.get("camera")
+        if camera:
+            style_parts.append(camera)
+
+        detail = params.get(
+            "detail",
+            "highly detailed, well-lit, high-resolution",
+        )
+        if detail:
+            style_parts.append(detail)
+
+        guidance = params.get(
+            "guidance",
+            "no text, captions or watermarks within the scene",
+        )
+
+        segments = [
+            segment for segment in [base, ". ".join(style_parts), guidance] if segment
+        ]
+        return ". ".join(segments)
 
     def _generate_image(self, task: GenerationTask) -> Dict[str, Any]:
         """Generate an image using DALL-E and download the bytes with C2PA metadata."""
         try:
-            bt.logging.info(f"Generating image with DALL-E: {task.prompt[:50]}...")
+            final_prompt = self._build_image_prompt(task)
+            bt.logging.info(
+                f"Generating image with DALL-E: {final_prompt[:100]}..."
+            )
             params = task.parameters or {}
             width = params.get("width", 1024)
             height = params.get("height", 1024)
@@ -82,7 +120,7 @@ class OpenAIService(BaseGenerationService):
 
             response = self.client.images.generate(
                 model="dall-e-3",
-                prompt=task.prompt,
+                prompt=final_prompt,
                 size=size,
                 quality=quality,
                 n=1,

@@ -124,16 +124,20 @@ if (config.axonExternalIp && config.axonExternalIp !== 'auto') {
 }
 
 // PM2 Apps configuration
+// We run the Python interpreter directly as a binary and let PM2 manage it,
+// to avoid PM2's Node/Bun process container trying to execute Python.
 const apps = [
   {
     name: 'bitmind-generative-miner',
-    script: minerScript,
-    interpreter: pythonInterpreter,
-    args: minerArgs.join(' '),
+    script: pythonInterpreter,
+    exec_interpreter: 'none',
+    // First argument is the miner script path, followed by miner CLI args
+    args: [minerScript, ...minerArgs].join(' '),
     env: {
       ...DYNAMIC_ENV,
     },
     watch: false,
+    exec_mode: 'fork',
     instances: 1,
     autorestart: true,
     max_restarts: 10,
