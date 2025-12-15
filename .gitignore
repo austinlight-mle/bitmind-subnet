@@ -76,5 +76,3 @@ downloaded_models/*
 generated_content/*
 
 wandb/*
-
-miner_generated_content/*
