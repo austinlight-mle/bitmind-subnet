@@ -102,10 +102,17 @@ class GeminiVideoService(BaseGenerationService):
 
         model: str = params.get("model", self.default_model)
 
-        duration_value = params.get(
+        # durationSeconds must be a JSON number for the Gemini API, not a string
+        duration_raw = params.get(
             "durationSeconds", params.get("seconds", params.get("duration", 4))
         )
-        duration_seconds = str(duration_value)
+        try:
+            duration_seconds: float = float(duration_raw)
+        except (TypeError, ValueError):  # noqa: PERF203
+            bt.logging.warning(
+                "Invalid durationSeconds value %r, falling back to 4s", duration_raw
+            )
+            duration_seconds = 4.0
 
         aspect_ratio = params.get("aspectRatio", params.get("aspect_ratio", "16:9"))
         resolution = params.get("resolution", "720p")
@@ -134,6 +141,7 @@ class GeminiVideoService(BaseGenerationService):
                 }
             ],
             "parameters": {
+                # Gemini expects a numeric value here
                 "durationSeconds": duration_seconds,
                 "aspectRatio": aspect_ratio,
                 "resolution": resolution,
