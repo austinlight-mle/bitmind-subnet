@@ -9,10 +9,10 @@ import bittensor as bt
 import numpy as np
 from PIL import Image
 from diffusers.utils import export_to_video
-from diffusers import StableDiffusionPipeline, AnimateDiffPipeline, DDIMScheduler, MotionAdapter, EulerDiscreteScheduler
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
-            
+from diffusers import StableDiffusionPipeline, HunyuanVideoPipeline
+
+from gas.generation.util.model import load_hunyuanvideo_transformer
+
 from .base_service import BaseGenerationService
 from ..task_manager import GenerationTask
 
@@ -100,52 +100,73 @@ class LocalService(BaseGenerationService):
             raise
 
     def _load_video_model(self):
-        """Load video generation model."""
+        """Load HunyuanVideo model for local text-to-video generation.
+
+        Uses the same local-first strategy as the gas.generation utilities:
+        - Try to load weights from the local HF cache.
+        - If missing, download from HuggingFace.
+
+        The model is configured to run efficiently on modern GPUs (H100, A100)
+        using bfloat16 where supported, while falling back to float16 on older GPUs.
+        """
         try:
-            # AnimateDiff-Lightning setup per official docs
-            step = 4  # Options: [1, 2, 4, 8]
-            self._ad_lightning_step = step
-            repo = "ByteDance/AnimateDiff-Lightning"
-            ckpt = f"animatediff_lightning_{step}step_diffusers.safetensors"
-            base_model_id = "emilianJR/epiCRealism"
+            model_id = "tencent/HunyuanVideo"
+            revision = "refs/pr/18"
 
-            bt.logging.info(
-                f"Loading AnimateDiff-Lightning video model: base={base_model_id}, step={step}"
+            bt.logging.info(f"Loading HunyuanVideo video model: {model_id} (revision={revision})")
+
+            # Choose dtype based on GPU capabilities: prefer bfloat16 on Ampere+ (A100/H100),
+            # fall back to float16 on older GPUs.
+            dtype = torch.bfloat16
+            if torch.cuda.is_available():
+                try:
+                    major, minor = torch.cuda.get_device_capability()
+                    if major < 8:  # pre-Ampere architectures lack native bf16
+                        dtype = torch.float16
+                except Exception:
+                    # If capability detection fails, default to float16 for safety
+                    dtype = torch.float16
+
+            # Load the transformer with local-first strategy
+            transformer = load_hunyuanvideo_transformer(
+                model_id=model_id,
+                subfolder="transformer",
+                torch_dtype=dtype if dtype is torch.bfloat16 else torch.float16,
+                revision=revision,
             )
 
-            adapter = MotionAdapter().to(self.device, torch.float16)
+            # Load the full pipeline (also local-first where possible)
             try:
-                bt.logging.info(f"Attempting to load AnimateDiff adapter from local cache...")
-                checkpoint_path = hf_hub_download(repo, ckpt, local_files_only=True)
-            except (OSError, ValueError) as e:
-                bt.logging.info(f"Adapter not in local cache, downloading from HuggingFace...")
-                checkpoint_path = hf_hub_download(repo, ckpt)
-            adapter.load_state_dict(load_file(checkpoint_path, device=self.device))
-
-            try:
-                bt.logging.info(f"Attempting to load {base_model_id} from local cache...")
-                pipe = AnimateDiffPipeline.from_pretrained(
-                    base_model_id,
-                    motion_adapter=adapter,
-                    torch_dtype=torch.float16,
+                bt.logging.info("Attempting to load HunyuanVideo pipeline from local cache...")
+                pipe = HunyuanVideoPipeline.from_pretrained(
+                    model_id,
+                    transformer=transformer,
+                    torch_dtype=dtype,
+                    revision=revision,
                     local_files_only=True,
-                ).to(self.device)
-            except (OSError, ValueError) as e:
-                bt.logging.info(f"Pipeline not in local cache, downloading from HuggingFace...")
-                pipe = AnimateDiffPipeline.from_pretrained(
-                    base_model_id,
-                    motion_adapter=adapter,
-                    torch_dtype=torch.float16,
-                ).to(self.device)
+                )
+            except (OSError, ValueError):
+                bt.logging.info("HunyuanVideo pipeline not in local cache, downloading from HuggingFace...")
+                pipe = HunyuanVideoPipeline.from_pretrained(
+                    model_id,
+                    transformer=transformer,
+                    torch_dtype=dtype,
+                    revision=revision,
+                )
 
-            pipe.scheduler = EulerDiscreteScheduler.from_config(
-                pipe.scheduler.config,
-                timestep_spacing="trailing",
-                beta_schedule="linear",
-            )
+            # Enable VAE tiling to reduce memory usage for high resolutions
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling()
+
+            # Move to configured device (e.g., cuda / cuda:0)
+            pipe = pipe.to(self.device)
 
             self.video_model = pipe
-            bt.logging.success("✅ AnimateDiff-Lightning video model loaded")
+            self._video_model_id = model_id
+            self._video_model_revision = revision
+            self._video_model_dtype = str(dtype)
+
+            bt.logging.success("✅ HunyuanVideo video model loaded")
 
         except Exception as e:
             bt.logging.error(f"Failed to load video model: {e}")
@@ -249,65 +270,113 @@ class LocalService(BaseGenerationService):
             raise
     
     def _generate_video_local(self, task: GenerationTask) -> Dict[str, Any]:
-        """Generate a video using local AnimateDiff model.""" 
+        """Generate a video using the local HunyuanVideo model.
+
+        This preserves the existing service contract used throughout the miner:
+        - Accepts task.parameters with familiar keys: height, width, num_frames,
+          fps, guidance_scale, num_inference_steps, negative_prompt, seed.
+        - Returns a dict with binary MP4 bytes under "data" and a "metadata"
+          dict that is propagated to webhooks as x-meta-* headers.
+        """
         try:
             bt.logging.info(f"Generating video locally: {task.prompt[:50]}...")
-            
+
             if self.video_model is None:
                 raise ValueError("Video model not loaded")
-            
+
             # Ensure parameters is not None
             params = task.parameters or {}
-            
-            height = params.get("height", 512)
-            width = params.get("width", 512) 
-            num_frames = params.get("num_frames", 16)
-            # AnimateDiff-Lightning expects low guidance and specific step count
-            guidance_scale = params.get("guidance_scale", 1.0)
-            default_steps = getattr(self, "_ad_lightning_step", 4)
-            num_inference_steps = params.get("num_inference_steps", default_steps)
-            fps = params.get("fps", 15)
-            
-            negative_prompt = params.get(
-                "negative_prompt",
-                "low quality, blurry, distorted, watermark"
-            )
-            
-            # Generate video
-            bt.logging.debug("Running AnimateDiff video generation...")
-            output = self.video_model(
-                prompt=task.prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps,
-            )
-            
-            # Extract frames from output
+
+            # Resolution handling (backwards compatible):
+            # - Explicit height/width win
+            # - Otherwise, allow a `resolution: [H, W]` tuple as used elsewhere
+            # - Default to a Hunyuan-friendly 720p landscape resolution
+            height = params.get("height")
+            width = params.get("width")
+
+            resolution = params.get("resolution")
+            if resolution and isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+                if height is None:
+                    height = int(resolution[0])
+                if width is None:
+                    width = int(resolution[1])
+
+            if height is None:
+                height = 576
+            if width is None:
+                width = 1024
+
+            # Frame and sampling parameters.
+            # Defaults tuned for faster generation on H100 while retaining quality.
+            num_frames = int(params.get("num_frames", 33))
+            num_inference_steps = int(params.get("num_inference_steps", 20))
+            guidance_scale = float(params.get("guidance_scale", 5.5))
+            fps = int(params.get("fps", 24))
+
+            negative_prompt = params.get("negative_prompt")
+
+            # Optional deterministic seed support for reproducibility
+            generator = None
+            if "seed" in params:
+                try:
+                    seed = int(params["seed"])
+                    device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
+                    generator = torch.Generator(device_type).manual_seed(seed)
+                except Exception as e:
+                    bt.logging.warning(f"Failed to create generator with seed: {e}")
+
+            bt.logging.debug("Running HunyuanVideo video generation...")
+
+            call_kwargs: Dict[str, Any] = {
+                "prompt": task.prompt,
+                "height": int(height),
+                "width": int(width),
+                "num_frames": num_frames,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+            }
+            if negative_prompt:
+                call_kwargs["negative_prompt"] = negative_prompt
+            if generator is not None:
+                call_kwargs["generator"] = generator
+
+            output = self.video_model(**call_kwargs)
+
+            # HunyuanVideoPipelineOutput.frames is either a tensor or list-of-images
             frames = output.frames[0]
-            bt.logging.info(f"Generated {len(frames)} frames")
-            
-            # Convert video frames to bytes
+            bt.logging.info(f"Generated {len(frames)} frames with HunyuanVideo")
+
+            # Convert video frames to MP4 bytes
             video_bytes = self._frames_to_video_bytes(frames, fps=fps)
-            
-            bt.logging.success(f"Video generated successfully with AnimateDiff model: {len(video_bytes)} bytes")
-            
+
+            bt.logging.success(
+                f"Video generated successfully with HunyuanVideo model: {len(video_bytes)} bytes"
+            )
+
+            metadata: Dict[str, Any] = {
+                "model": "HunyuanVideo",
+                "width": int(width),
+                "height": int(height),
+                "num_frames": int(num_frames),
+                "fps": int(fps),
+                "guidance_scale": guidance_scale,
+                "num_inference_steps": int(num_inference_steps),
+                "provider": "local",
+            }
+
+            # Attach additional model metadata when available
+            if hasattr(self, "_video_model_id"):
+                metadata["model_id"] = getattr(self, "_video_model_id")
+            if hasattr(self, "_video_model_revision"):
+                metadata["revision"] = getattr(self, "_video_model_revision")
+            if hasattr(self, "_video_model_dtype"):
+                metadata["dtype"] = getattr(self, "_video_model_dtype")
+
             return {
                 "data": video_bytes,
-                "metadata": {
-                    "model": "AnimateDiff",
-                    "width": width,
-                    "height": height,
-                    "num_frames": num_frames,
-                    "fps": fps,
-                    "guidance_scale": guidance_scale,
-                    "num_inference_steps": num_inference_steps,
-                    "provider": "local"
-                }
+                "metadata": metadata,
             }
-            
+
         except Exception as e:
             bt.logging.error(f"Local video generation failed: {e}")
             raise
