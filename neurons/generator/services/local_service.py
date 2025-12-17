@@ -158,8 +158,39 @@ class LocalService(BaseGenerationService):
             if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
                 pipe.vae.enable_tiling()
 
-            # Move to configured device (e.g., cuda / cuda:0)
-            pipe = pipe.to(self.device)
+            # Move to configured device (e.g., cuda / cuda:0).
+            #
+            # HunyuanVideo is extremely large and can easily exhaust 24GB GPUs
+            # when fully loaded on CUDA. On GPUs with less than ~40GB of VRAM,
+            # prefer Diffusers' CPU offload path to avoid CUDA OOM during model
+            # initialization, at the cost of slower generation.
+            if str(self.device).startswith("cuda"):
+                try:
+                    props = torch.cuda.get_device_properties(0)
+                    total_gb = props.total_memory / (1024 ** 3)
+                except Exception:
+                    total_gb = None
+
+                if (
+                    total_gb is not None
+                    and total_gb < 40
+                    and hasattr(pipe, "enable_model_cpu_offload")
+                ):
+                    bt.logging.info(
+                        f"Enabling CPU offload for HunyuanVideo pipeline on GPU with ~{total_gb:.2f} GiB VRAM"
+                    )
+                    try:
+                        pipe.enable_model_cpu_offload()
+                    except Exception as offload_err:  # noqa: BLE001
+                        bt.logging.warning(
+                            f"Failed to enable CPU offload for HunyuanVideo pipeline: {offload_err}; "
+                            "falling back to .to(device)"
+                        )
+                        pipe = pipe.to(self.device)
+                else:
+                    pipe = pipe.to(self.device)
+            else:
+                pipe = pipe.to(self.device)
 
             self.video_model = pipe
             self._video_model_id = model_id

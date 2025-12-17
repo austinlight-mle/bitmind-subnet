@@ -75,4 +75,7 @@ downloaded_models/*
 
 generated_content/*
 
+node_modules/
 wandb/*
+
+hf_cache/

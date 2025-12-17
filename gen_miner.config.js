@@ -1,12 +1,12 @@
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 
 // Helper functions
 function getPythonInterpreter() {
-  const projectRoot = __dirname;
-  const venvPython = path.join(projectRoot, '.venv', 'bin', 'python');
-  const fs = require('fs');
-  return fs.existsSync(venvPython) ? venvPython : 'python3';
+	const projectRoot = __dirname;
+	const venvPython = path.join(projectRoot, '.venv', 'bin', 'python');
+	return fs.existsSync(venvPython) ? venvPython : 'python3';
 }
 
 function getNetworkSettings(chainEndpoint) {
@@ -27,10 +27,32 @@ function getAutoUpdateParam(autoUpdate) {
   return autoUpdate === 'true' ? '' : '--autoupdate-off';
 }
 
-// Dynamically load environment variables from .env.gen_miner
+// Dynamically load environment variables from .env.gen_miner without external deps
 const envPath = path.resolve(__dirname, '.env.gen_miner');
-const envConfig = require('dotenv').config({ path: envPath });
-const envFileVars = envConfig.parsed || {};
+let envFileVars = {};
+if (fs.existsSync(envPath)) {
+	try {
+		const raw = fs.readFileSync(envPath, 'utf8');
+		envFileVars = raw
+			.split('\n')
+			.map(line => line.trim())
+			.filter(line => line && !line.startsWith('#'))
+			.reduce((acc, line) => {
+				const idx = line.indexOf('=');
+				if (idx === -1) return acc;
+				const key = line.slice(0, idx).trim();
+				let value = line.slice(idx + 1).trim();
+				if ((value.startsWith('"') && value.endsWith('"')) ||
+					(value.startsWith("'") && value.endsWith("'"))) {
+					value = value.slice(1, -1);
+				}
+				acc[key] = value;
+				return acc;
+			}, {});
+	} catch (e) {
+		console.warn('Failed to load .env.gen_miner:', e);
+	}
+}
 
 // Apply to process.env for compatibility with existing config logic
 Object.assign(process.env, envFileVars);
