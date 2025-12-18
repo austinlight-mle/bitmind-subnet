@@ -175,7 +175,8 @@ class OpenAIService(BaseGenerationService):
         params: Dict[str, Any] = task.parameters or {}
 
         model: str = params.get("model", "sora-2")  # or "sora-2-pro"
-        size: str = params.get("size", "720x1280")  # e.g. "1280x720"
+        # Default to landscape 16:9 (1280x720); miners can override via task.parameters["size"]
+        size: str = params.get("size", "1280x720")  # e.g. "720x1280" for portrait
         seconds_value = params.get("seconds", params.get("duration", 4))
         seconds: str = str(seconds_value)
 
